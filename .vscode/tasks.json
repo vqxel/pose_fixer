@@ -1,0 +1,43 @@
+{
+	"version": "2.0.0",
+	"tasks": [
+		{
+			"type": "cargo",
+			"command": "run",
+			"args": ["--features", "nrf52832"],
+			"problemMatcher": [
+				"$rustc"
+			],
+			"label": "rust: deploy devboard code",
+			"group": {
+				"kind": "build",
+				"isDefault": true
+			},
+			"options": {
+				"cwd": "${workspaceFolder}/devboard",
+			},
+			"presentation": {
+				"reveal": "always",
+			}
+		},
+		{
+			"type": "cargo",
+			"command": "build",
+			"args": ["--features", "nrf52832"],
+			"problemMatcher": [
+				"$rustc"
+			],
+			"label": "rust: build devboard code",
+			"group": {
+				"kind": "build",
+				"isDefault": true
+			},
+			"options": {
+				"cwd": "${workspaceFolder}/devboard",
+			},
+			"presentation": {
+				"reveal": "always",
+			}
+		}
+	]
+}
