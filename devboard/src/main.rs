@@ -1,20 +1,17 @@
 #![no_std]
 #![no_main]
 
-use core::cell::{RefCell, UnsafeCell};
-use core::fmt::Error;
-use core::mem::{self, MaybeUninit};
-use atomic_pool::Box;
-use defmt_rtt as _;
+use core::mem;
+
 use embassy_executor::Spawner;
-use embassy_nrf::interrupt;
-use embassy_sync::blocking_mutex::raw::{CriticalSectionRawMutex, ThreadModeRawMutex};
-use embassy_sync::mutex::Mutex;
-use embassy_sync::signal::Signal;
+use embassy_nrf::interrupt::InterruptExt;
+use embassy_nrf::peripherals::SAADC;
+use embassy_nrf::saadc::{AnyInput, Input, Saadc};
+use embassy_nrf::{bind_interrupts, interrupt, saadc};
 use futures::future::{select, Either};
 use futures::pin_mut;
-use nrf_softdevice::ble::gatt_server::builder::{CharacteristicBuilder, ServiceBuilder};
-use nrf_softdevice::ble::gatt_server::characteristic::{Attribute, Metadata, Presentation, Properties};
+use nrf_softdevice::ble::gatt_server::builder::ServiceBuilder;
+use nrf_softdevice::ble::gatt_server::characteristic::{Attribute, Metadata, Properties};
 use nrf_softdevice::ble::gatt_server::{CharacteristicHandles, NotifyValueError, RegisterError};
 use nrf_softdevice::ble::security::SecurityHandler;
 // global logger
@@ -27,7 +24,7 @@ use embassy_time::Timer;
 use nrf_softdevice::ble::advertisement_builder::{
     Flag, LegacyAdvertisementBuilder, LegacyAdvertisementPayload, ServiceList, ServiceUuid16,
 };
-use nrf_softdevice::ble::{gatt_client, gatt_server, peripheral, Connection, Uuid};
+use nrf_softdevice::ble::{gatt_server, peripheral, Connection, Uuid};
 use nrf_softdevice::{raw, Softdevice};
 
 #[embassy_executor::task]
@@ -41,6 +38,34 @@ const DEVICE_INFORMATION_SERVICE: Uuid = Uuid::new_16(0x180a);
 const MANUFACTURER_NAME: Uuid = Uuid::new_16(0x2A29);
 const SERIAL_NUMBER: Uuid = Uuid::new_16(0x2A25);
 const BATTERY_LEVEL: Uuid = Uuid::new_16(0x2a19);
+
+struct FlexService {
+    value_handle: u16,
+    cccd_handle: u16,
+}
+
+impl FlexService {
+    pub fn new(sd: &mut Softdevice) -> Result<Self, RegisterError> {
+        let uuid = Uuid::new_128(&0xc7e61440_1f83_438a_987f_937380d095dc_u128.to_le_bytes());
+        let mut service_builder = ServiceBuilder::new(sd, uuid)?;
+
+        let attr = Attribute::new(&[0u8]);
+        let metadata = Metadata::new(Properties::new().read().notify());
+        let characteristic_builder = service_builder.add_characteristic(uuid, attr, metadata)?;
+        let characteristic_handles = characteristic_builder.build();
+
+        let _service_handle = service_builder.build();
+
+        Ok(FlexService {
+            value_handle: characteristic_handles.value_handle,
+            cccd_handle: characteristic_handles.cccd_handle,
+        })
+    }
+
+    pub fn flex_notify(&self, conn: &Connection, val: i16) -> Result<(), NotifyValueError> {
+        gatt_server::notify_value(conn, self.value_handle, &val.to_le_bytes())
+    }
+}
 
 struct BatteryService {
     value_handle: u16,
@@ -138,6 +163,7 @@ impl DeviceInformationService {
 struct Server {
     _dis: DeviceInformationService,
     bas: BatteryService,
+    fes: FlexService,
 }
 
 impl Server {
@@ -152,7 +178,9 @@ impl Server {
 
         let bas = BatteryService::new(sd)?;
 
-        Ok(Self { _dis: dis, bas: bas })
+        let fes = FlexService::new(sd)?;
+
+        Ok(Self { _dis: dis, bas: bas, fes: fes })
     }
 }
 
@@ -197,6 +225,30 @@ async fn update_battery_counter_future<'a>(server: &'a Server, conn: &'a Connect
 
         Timer::after_millis(5000).await;
     }
+}
+
+async fn update_resistor_value<'a>(saadc: &'a mut Saadc<'_, 1>, server: &'a Server, conn: &'a Connection) {
+    loop {
+        let mut buf = [0i16; 1];
+        saadc.sample(&mut buf).await;
+
+        // We only sampled one ADC channel.
+        let adc_raw_value: i16 = buf[0];
+
+        server.fes.flex_notify(conn, adc_raw_value);
+    }
+}
+
+bind_interrupts!(struct Irqs {
+    SAADC => saadc::InterruptHandler;
+});
+
+fn init_adc(pin: AnyInput, adc: SAADC) -> Saadc<'static, 1> {
+    let config = saadc::Config::default();
+    let channel_cfg = saadc::ChannelConfig::single_ended(pin.degrade_saadc());
+    interrupt::SAADC.set_priority(interrupt::Priority::P3);
+    let saadc = saadc::Saadc::new(adc, Irqs, config, [channel_cfg]);
+    saadc
 }
 
 #[embassy_executor::main]
@@ -245,6 +297,10 @@ async fn main(spawner: Spawner) {
     // Spawned tasks run in the background, concurrently.
     unwrap!(spawner.spawn(blink(p.P0_15.degrade())));
 
+    let resistor_pin = p.P0_02.degrade_saadc();
+    let mut saadc = init_adc(resistor_pin, p.SAADC);
+    saadc.calibrate().await;
+
     static ADV_DATA: LegacyAdvertisementPayload = LegacyAdvertisementBuilder::new()
         .flags(&[Flag::GeneralDiscovery, Flag::LE_Only])
         .services_16(
@@ -290,27 +346,3 @@ async fn main(spawner: Spawner) {
         };
     }
 }
-
-// GATT Server
-/*
-match e {
-            ServerEvent::Bas(e) => match e {
-                BatteryServiceEvent::BatteryLevelCccdWrite { notifications } => {
-                    info!("battery notifications: {}", notifications)
-                }
-            },
-            ServerEvent::Foo(e) => match e {
-                FooServiceEvent::FooWrite(val) => {
-                    info!("wrote foo: {}", val);
-                    if let Err(e) = server.foo.foo_notify(&conn, &(val + 1)) {
-                        info!("send notification error: {:?}", e);
-                    }
-                }
-                FooServiceEvent::FooCccdWrite {
-                    indications,
-                    notifications,
-                } => {
-                    info!("foo indications: {}, notifications: {}", indications, notifications)
-                }
-            },
-        } */
