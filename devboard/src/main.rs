@@ -1,15 +1,16 @@
 #![no_std]
 #![no_main]
 
-use core::mem;
+use core::task::Context;
+use core::{future, mem};
 
 use embassy_executor::Spawner;
 use embassy_nrf::interrupt::InterruptExt;
 use embassy_nrf::peripherals::SAADC;
 use embassy_nrf::saadc::{AnyInput, Input, Saadc};
 use embassy_nrf::{bind_interrupts, interrupt, saadc};
-use futures::future::{select, Either};
-use futures::pin_mut;
+use futures::future::{join, select, Either};
+use futures::{pin_mut, Future, FutureExt};
 use nrf_softdevice::ble::gatt_server::builder::ServiceBuilder;
 use nrf_softdevice::ble::gatt_server::characteristic::{Attribute, Metadata, Properties};
 use nrf_softdevice::ble::gatt_server::{CharacteristicHandles, NotifyValueError, RegisterError};
@@ -235,7 +236,7 @@ async fn update_resistor_value<'a>(saadc: &'a mut Saadc<'_, 1>, server: &'a Serv
         // We only sampled one ADC channel.
         let adc_raw_value: i16 = buf[0];
 
-        server.fes.flex_notify(conn, adc_raw_value);
+        let _ = server.fes.flex_notify(conn, adc_raw_value);
     }
 }
 
@@ -326,6 +327,7 @@ async fn main(spawner: Spawner) {
         info!("advertising done!");
 
         let battery_counter_future = update_battery_counter_future(&server, &conn);
+        let update_resistor_value = update_resistor_value(&mut saadc, &server, &conn);
         
         // Run the GATT server on the connection. This returns when the connection gets disconnected.
         //
@@ -335,13 +337,16 @@ async fn main(spawner: Spawner) {
 
         pin_mut!(battery_counter_future);
         pin_mut!(gatt_server_future);
+        pin_mut!(update_resistor_value);
 
-        let _ = match select(gatt_server_future, battery_counter_future).await {
+        let joined_fut = join(battery_counter_future, update_resistor_value);
+
+        let _ = match select(gatt_server_future, joined_fut).await {
             Either::Left((e, _)) => {
                 info!("gatt_server encountered an error and stopped: {:?}", e);
             }
             Either::Right((_, _)) => {
-                info!("bas encountered an error and stopped");
+                info!("bas/adc encountered an error and stopped");
             }
         };
     }
