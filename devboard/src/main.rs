@@ -3,6 +3,8 @@
 
 use core::task::Context;
 use core::{future, mem};
+use core::fmt::Error;
+use defmt_rtt as _;
 
 use embassy_executor::Spawner;
 use embassy_nrf::interrupt::InterruptExt;
@@ -50,7 +52,7 @@ impl FlexService {
         let uuid = Uuid::new_128(&0xc7e61440_1f83_438a_987f_937380d095dc_u128.to_le_bytes());
         let mut service_builder = ServiceBuilder::new(sd, uuid)?;
 
-        let attr = Attribute::new(&[0u8]);
+        let attr = Attribute::new(&[0u8, 0u8]);
         let metadata = Metadata::new(Properties::new().read().notify());
         let characteristic_builder = service_builder.add_characteristic(uuid, attr, metadata)?;
         let characteristic_handles = characteristic_builder.build();
@@ -237,6 +239,8 @@ async fn update_resistor_value<'a>(saadc: &'a mut Saadc<'_, 1>, server: &'a Serv
         let adc_raw_value: i16 = buf[0];
 
         let _ = server.fes.flex_notify(conn, adc_raw_value);
+
+        Timer::after_millis(1000).await;
     }
 }
 
