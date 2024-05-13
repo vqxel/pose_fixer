@@ -9,12 +9,14 @@ use defmt_rtt as _;
 use embassy_executor::Spawner;
 use embassy_nrf::interrupt::InterruptExt;
 use embassy_nrf::peripherals::SAADC;
-use embassy_nrf::saadc::{AnyInput, Input, Saadc};
+use embassy_nrf::saadc::{AnyInput, Input, Reference, Resolution, Saadc};
 use embassy_nrf::{bind_interrupts, interrupt, saadc};
+use embassy_sync::blocking_mutex::raw::ThreadModeRawMutex;
+use embassy_sync::pubsub::PubSubChannel;
 use futures::future::{join, select, Either};
 use futures::{pin_mut, Future, FutureExt};
 use nrf_softdevice::ble::gatt_server::builder::ServiceBuilder;
-use nrf_softdevice::ble::gatt_server::characteristic::{Attribute, Metadata, Properties};
+use nrf_softdevice::ble::gatt_server::characteristic::{Attribute, Metadata, Presentation, Properties};
 use nrf_softdevice::ble::gatt_server::{CharacteristicHandles, NotifyValueError, RegisterError};
 use nrf_softdevice::ble::security::SecurityHandler;
 // global logger
@@ -36,11 +38,14 @@ async fn softdevice_task(sd: &'static Softdevice) -> ! {
 }
 
 const BATTERY_SERVICE: Uuid = Uuid::new_16(0x180f);
+const BATTERY_LEVEL_CHARACTERISTIC: Uuid = Uuid::new_16(0x2A19);
 const DEVICE_INFORMATION_SERVICE: Uuid = Uuid::new_16(0x180a);
 
 const MANUFACTURER_NAME: Uuid = Uuid::new_16(0x2A29);
 const SERIAL_NUMBER: Uuid = Uuid::new_16(0x2A25);
 const BATTERY_LEVEL: Uuid = Uuid::new_16(0x2a19);
+
+const MAX_VOLTAGE: f32 = 3.3;
 
 struct FlexService {
     value_handle: u16,
@@ -81,10 +86,18 @@ impl BatteryService {
 
         let attr = Attribute::new(&[0u8]); // Unless im trippin, this is the actual value that we're tryna send
         let metadata = Metadata::new(Properties::new().read().notify()); // This is information like the CCCD info and stuff
-        let characteristic_builder = service_builder.add_characteristic(BATTERY_LEVEL, attr, metadata)?; // This puts it all together into the service
+        let characteristic_builder = service_builder.add_characteristic(BATTERY_LEVEL_CHARACTERISTIC, attr, metadata)?; // This puts it all together into the service
         let characteristic_handles = characteristic_builder.build(); // Ig this is just a factory lol
 
         let _service_handle = service_builder.build(); // Another factory :sob:
+
+        /*.presentation(Presentation {
+            format: todo!(),
+            exponent: todo!(),
+            unit: 0x27AD,
+            name_space: todo!(),
+            description: todo!(),
+        }) */
 
         Ok(BatteryService {
             value_handle: characteristic_handles.value_handle,
@@ -219,6 +232,26 @@ async fn blink(pin: AnyPin) {
     }
 }
 
+static SHARED_BATTERY_VOLTAGE_RAW: PubSubChannel<ThreadModeRawMutex, i16, 1, 1, 1> = PubSubChannel::new();
+static SHARED_RESISTOR_VALUE_RAW: PubSubChannel<ThreadModeRawMutex, i16, 1, 1, 1> = PubSubChannel::new();
+
+#[embassy_executor::task]
+async fn update_adc(resistor_pin: AnyInput, battery_voltage_pin: AnyInput, saadc_peripheral: SAADC) {
+    let mut saadc = init_adc(resistor_pin, battery_voltage_pin, saadc_peripheral);
+    saadc.calibrate().await;
+
+    let battery_voltage_raw_publisher = SHARED_BATTERY_VOLTAGE_RAW.publisher().unwrap();
+    let resistor_value_raw_publisher = SHARED_RESISTOR_VALUE_RAW.publisher().unwrap();
+    loop {
+        let mut buf = [0i16; 2];
+        saadc.sample(&mut buf).await; 
+        let _ = resistor_value_raw_publisher.publish_immediate(buf[0]);
+        let _ = battery_voltage_raw_publisher.publish_immediate(buf[1]);
+
+        Timer::after_secs(1).await;
+    }
+}
+
 async fn update_battery_counter_future<'a>(server: &'a Server, conn: &'a Connection) {
     let mut i: u8 = 0;
     loop {
@@ -230,17 +263,32 @@ async fn update_battery_counter_future<'a>(server: &'a Server, conn: &'a Connect
     }
 }
 
-async fn update_resistor_value<'a>(saadc: &'a mut Saadc<'_, 1>, server: &'a Server, conn: &'a Connection) {
+async fn update_resistor_value<'a>(server: &'a Server, conn: &'a Connection) {
+    let mut resistor_value_raw_subscriber = SHARED_RESISTOR_VALUE_RAW.subscriber().unwrap();
     loop {
-        let mut buf = [0i16; 1];
-        saadc.sample(&mut buf).await;
+        let resistor_value_raw = resistor_value_raw_subscriber.next_message_pure().await;
 
-        // We only sampled one ADC channel.
-        let adc_raw_value: i16 = buf[0];
+        let _ = server.fes.flex_notify(conn, resistor_value_raw);
+    }
+}
 
-        let _ = server.fes.flex_notify(conn, adc_raw_value);
+async fn update_battery_charge<'a>(server: &'a Server, conn: &'a Connection) {
+    let mut battery_voltage_raw_subscriber = SHARED_BATTERY_VOLTAGE_RAW.subscriber().unwrap();
+    loop {
+        let adc_raw_value = battery_voltage_raw_subscriber.next_message_pure().await;
 
-        Timer::after_millis(1000).await;
+        // Calcs. Link 1 has the formula used to get from P to result and link 2 has some more info that's useful (REFERENCE being 0.6v)
+        // [1] https://infocenter.nordicsemi.com/index.jsp?topic=%2Fcom.nordic.infocenter.nrf52832.ps.v1.1%2Fsaadc.html&cp=2_1_0_36_2&anchor=saadc_digital_output
+        // [2] https://infocenter.nordicsemi.com/index.jsp?topic=%2Fcom.nordic.infocenter.nrf52832.ps.v1.1%2Fsaadc.html&anchor=unique_1699153141
+        
+        // result = (P - 0) * 1_6? / REF * 2^(12-0)
+        // result = P * (1/6) / REF * 2^12
+        // P = result / (1/6) * REF / 2^12
+        // 2^12 = 4096
+        let deconstructed_voltage = (adc_raw_value as f32) * 6f32 * 0.6 / 4096f32;
+        let percentage = deconstructed_voltage / 3.3;
+
+        let _ = server.bas.battery_level_notify(conn, (percentage * 100f32) as u8);
     }
 }
 
@@ -248,11 +296,12 @@ bind_interrupts!(struct Irqs {
     SAADC => saadc::InterruptHandler;
 });
 
-fn init_adc(pin: AnyInput, adc: SAADC) -> Saadc<'static, 1> {
+fn init_adc(resistor_pin: AnyInput, battery_voltage_pin: AnyInput, adc: SAADC) -> Saadc<'static, 2> {
     let config = saadc::Config::default();
-    let channel_cfg = saadc::ChannelConfig::single_ended(pin.degrade_saadc());
+    let resistor_channel_cfg = saadc::ChannelConfig::single_ended(resistor_pin.degrade_saadc());
+    let battery_channel_cfg = saadc::ChannelConfig::single_ended(battery_voltage_pin.degrade_saadc());
     interrupt::SAADC.set_priority(interrupt::Priority::P3);
-    let saadc = saadc::Saadc::new(adc, Irqs, config, [channel_cfg]);
+    let saadc = saadc::Saadc::new(adc, Irqs, config, [resistor_channel_cfg, battery_channel_cfg]);
     saadc
 }
 
@@ -297,14 +346,13 @@ async fn main(spawner: Spawner) {
 
     let sd = Softdevice::enable(&config);
     let server = unwrap!(Server::new(sd));
-    unwrap!(spawner.spawn(softdevice_task(sd)));
-
-    // Spawned tasks run in the background, concurrently.
-    unwrap!(spawner.spawn(blink(p.P0_15.degrade())));
 
     let resistor_pin = p.P0_02.degrade_saadc();
-    let mut saadc = init_adc(resistor_pin, p.SAADC);
-    saadc.calibrate().await;
+    let battery_voltage_pin = p.P0_03.degrade_saadc();
+
+    unwrap!(spawner.spawn(softdevice_task(sd)));
+    unwrap!(spawner.spawn(blink(p.P0_15.degrade())));
+    unwrap!(spawner.spawn(update_adc(resistor_pin, battery_voltage_pin, p.SAADC)));
 
     static ADV_DATA: LegacyAdvertisementPayload = LegacyAdvertisementBuilder::new()
         .flags(&[Flag::GeneralDiscovery, Flag::LE_Only])
@@ -330,8 +378,9 @@ async fn main(spawner: Spawner) {
         let conn = unwrap!(peripheral::advertise_pairable(sd, adv, &config, &SEC).await);
         info!("advertising done!");
 
-        let battery_counter_future = update_battery_counter_future(&server, &conn);
-        let update_resistor_value = update_resistor_value(&mut saadc, &server, &conn);
+        // let battery_counter_future = update_battery_counter_future(&server, &conn);
+        let update_battery_charge_future = update_battery_charge(&server, &conn);
+        let update_resistor_value = update_resistor_value(&server, &conn);
         
         // Run the GATT server on the connection. This returns when the connection gets disconnected.
         //
@@ -339,11 +388,12 @@ async fn main(spawner: Spawner) {
         // proc macro when applied to the Server struct above
         let gatt_server_future = gatt_server::run(&conn, &server, |_| {});
 
-        pin_mut!(battery_counter_future);
+        // pin_mut!(battery_counter_future);
+        pin_mut!(update_battery_charge_future);
         pin_mut!(gatt_server_future);
         pin_mut!(update_resistor_value);
 
-        let joined_fut = join(battery_counter_future, update_resistor_value);
+        let joined_fut = join(update_battery_charge_future, update_resistor_value);
 
         let _ = match select(gatt_server_future, joined_fut).await {
             Either::Left((e, _)) => {
